@@ -2,6 +2,8 @@
 
 Thief Cat 2.0 是一个 Databricks GLM 5.2 Access Token 自动化工具，负责邮箱验证、注册或登录、Workspace 进入，以及 AI Gateway Token 生成和账号分类。
 
+项目地址：<https://github.com/KanoNoUta/Thief-Cat-2.0>
+
 ## 特性
 
 - 仅支持 Outlook Graph OAuth 邮箱，流程更稳定、可重复登录。
@@ -37,6 +39,8 @@ Thief Cat 2.0 是一个 Databricks GLM 5.2 Access Token 自动化工具，负责
 ## 安装
 
 ```powershell
+git clone https://github.com/KanoNoUta/Thief-Cat-2.0.git
+Set-Location .\Thief-Cat-2.0
 python -m pip install -r .\requirements.txt
 ```
 
