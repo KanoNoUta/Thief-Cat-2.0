@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.env
+screenshots/
+glm_keys.csv
+registered_accounts.csv
+databricks_tokens.csv
+outlook_*.txt
+*.tmp
+dist/
