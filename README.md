@@ -6,7 +6,7 @@ Thief Cat 2.0 是一个 Databricks GLM 5.2 Access Token 自动化工具，负责
 
 ## 特性
 
-- 仅支持 Outlook Graph OAuth 邮箱，流程更稳定、可重复登录。
+- 支持 Outlook Graph OAuth 和 outlook.tw 匿名临时邮箱。
 - Outlook pending/success 队列自动迁移。
 - 动态等待 AI Gateway 和 GLM 5.2，不依赖固定模型 URL。
 - 一键点击 `Generate Access Token`，无需填写 PAT 表单。
@@ -15,7 +15,7 @@ Thief Cat 2.0 是一个 Databricks GLM 5.2 Access Token 自动化工具，负责
 
 ## 工作流
 
-1. 通过 Outlook Graph 获取验证码并登录 Databricks。
+1. 通过所选邮箱 provider 获取验证码并登录 Databricks。
 2. 处理 account setup，进入 Workspace。
 3. 打开 AI Gateway，等待模型列表加载。
 4. 点击 `GLM 5.2` 和 `Generate Access Token`。
@@ -29,6 +29,7 @@ Thief Cat 2.0 是一个 Databricks GLM 5.2 Access Token 自动化工具，负责
 - `get_glm_key.py`：发布版主入口。
 - `auto_register.py`：完整注册、登录、Workspace 和 Token 流程。
 - `outlook_graph.py`：Microsoft OAuth 与 Graph 邮件读取。
+- `outlook_tw.py`：outlook.tw 匿名临时邮箱 API 客户端。
 - `outlook_pending.txt`：尚未成功的 Outlook 凭据队列。
 - `outlook_success.txt`：已经成功的 Outlook 凭据。
 - `glm_keys.csv`：成功结果，固定为 `Domain,Token` 两列。
@@ -98,6 +99,37 @@ python .\get_glm_key.py `
   --outlook-success-file .\custom_success.txt
 ```
 
+## outlook.tw 临时邮箱
+
+网页的收件机制不是 IMAP：
+
+1. `GET /api/generate` 生成约一小时有效的匿名 `@outlook.tw` 地址。
+2. `GET /api/emails?mailbox=地址` 获取邮件列表。
+3. `GET /api/email/{id}` 获取邮件正文。
+4. 官网前端每 8 秒轮询一次列表；Thief Cat 使用 5 秒轮询并自动提取 Databricks 验证码。
+
+接口无需账号、密码或 cookie。邮箱地址本身就是访问凭据，任何知道完整地址的人都可能读取该收件箱，因此不要用于长期账号或敏感邮件。
+
+自动生成临时地址并注册：
+
+```powershell
+python .\get_glm_key.py `
+  --mail-provider outlook_tw `
+  --mail-timeout 300
+```
+
+临时地址仍在有效期内时续跑：
+
+```powershell
+python .\get_glm_key.py `
+  --mail-provider outlook_tw `
+  --email "temporary-address@outlook.tw" `
+  --resume `
+  --workspace "https://your-workspace.cloud.databricks.com"
+```
+
+outlook.tw 没有可迁移的密码或 refresh token，因此不会写入 Outlook pending/success 分类文件。
+
 ## 输出格式
 
 `glm_keys.csv`：
@@ -112,7 +144,7 @@ https://dbc-example.cloud.databricks.com,dapi...
 ## 验证
 
 ```powershell
-python -m py_compile .\get_glm_key.py .\auto_register.py .\outlook_graph.py .\mail_common.py
+python -m py_compile .\get_glm_key.py .\auto_register.py .\outlook_graph.py .\outlook_tw.py .\mail_common.py
 python -m unittest discover -s .\tests -v
 python .\get_glm_key.py --help
 ```

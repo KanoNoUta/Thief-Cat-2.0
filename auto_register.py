@@ -24,6 +24,7 @@ from playwright.sync_api import (
 )
 
 from outlook_graph import OutlookGraphClient, move_outlook_credential
+from outlook_tw import OutlookTwClient
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -74,15 +75,22 @@ LAST_NAMES = (
 
 
 def create_mail_client(
+    provider: str = "outlook",
     email: str | None = None,
     password: str | None = None,
     outlook_credential_file: str | None = None,
-) -> OutlookGraphClient:
-    return OutlookGraphClient.from_sources(
-        credential_file=outlook_credential_file,
-        email=email,
-        password=password,
-    )
+) -> OutlookGraphClient | OutlookTwClient:
+    if provider == "outlook":
+        return OutlookGraphClient.from_sources(
+            credential_file=outlook_credential_file,
+            email=email,
+            password=password,
+        )
+    if provider == "outlook_tw":
+        if password:
+            raise ValueError("outlook.tw temporary mailboxes do not use passwords")
+        return OutlookTwClient(email) if email else OutlookTwClient.create_account()
+    raise ValueError(f"Unknown mail provider: {provider}")
 
 
 def screenshot(page: Page | None, name: str) -> Path | None:
@@ -422,16 +430,37 @@ def resilient_goto(
 ):
     """遇到 Databricks 自己发起的导航时，等待其完成后再重试。"""
     last_error = None
+    target = urlparse(url)
     for attempt in range(1, attempts + 1):
         wait_for_navigation_stable(page, timeout=20)
         try:
             return page.goto(url, wait_until="domcontentloaded", timeout=timeout)
         except PlaywrightError as exc:
-            if "interrupted by another navigation" not in str(exc).lower():
+            error_text = str(exc).lower()
+            retryable = any(
+                marker in error_text
+                for marker in (
+                    "interrupted by another navigation",
+                    "navigation was interrupted",
+                    "net::err_aborted",
+                )
+            )
+            if not retryable:
                 raise
             last_error = exc
             print(f"  Databricks redirect in progress; retrying navigation ({attempt}/{attempts})...")
             wait_for_navigation_stable(page, timeout=30)
+            current = urlparse(page.url)
+            if (
+                target.hostname
+                and current.hostname == target.hostname
+                and (
+                    target.path in ("", "/")
+                    or current.path.rstrip("/").startswith(target.path.rstrip("/"))
+                )
+            ):
+                print("  Databricks redirect reached the requested page")
+                return None
     raise RuntimeError(f"Navigation kept being interrupted: {last_error}")
 
 
@@ -724,7 +753,11 @@ def wait_for_exact_text(
     *,
     allow_manual: bool,
     timeout: float,
+    progress_label: str | None = None,
+    progress_interval: float = 15,
 ):
+    started = time.monotonic()
+    next_progress = max(1, progress_interval)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         for scope in interaction_scopes(page):
@@ -740,6 +773,13 @@ def wait_for_exact_text(
         if wait_for_qr_resolution(page, allow_manual=allow_manual):
             wait_for_navigation_stable(page, timeout=30)
             continue
+        elapsed = time.monotonic() - started
+        if progress_label and elapsed >= next_progress:
+            print(
+                f"  Still waiting for {progress_label} "
+                f"({int(elapsed)}s/{int(timeout)}s)..."
+            )
+            next_progress += max(1, progress_interval)
         page.wait_for_timeout(1_000)
     return None
 
@@ -750,7 +790,11 @@ def wait_for_named_action(
     *,
     allow_manual: bool,
     timeout: float,
+    progress_label: str | None = None,
+    progress_interval: float = 15,
 ):
+    started = time.monotonic()
+    next_progress = max(1, progress_interval)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         action = named_action(page, names, timeout=300)
@@ -759,6 +803,13 @@ def wait_for_named_action(
         if wait_for_qr_resolution(page, allow_manual=allow_manual):
             wait_for_navigation_stable(page, timeout=30)
             continue
+        elapsed = time.monotonic() - started
+        if progress_label and elapsed >= next_progress:
+            print(
+                f"  Still waiting for {progress_label} "
+                f"({int(elapsed)}s/{int(timeout)}s)..."
+            )
+            next_progress += max(1, progress_interval)
         page.wait_for_timeout(1_000)
     return None
 
@@ -771,6 +822,7 @@ def open_ai_gateway(page: Page, *, allow_manual: bool) -> None:
         (AI_GATEWAY_LABEL,),
         allow_manual=allow_manual,
         timeout=180,
+        progress_label="AI Gateway navigation",
     )
     if not gateway:
         screenshot(page, "ai_gateway_missing")
@@ -785,6 +837,35 @@ def open_ai_gateway(page: Page, *, allow_manual: bool) -> None:
     else:
         gateway.click()
     wait_for_navigation_stable(page, timeout=30)
+
+
+def glm_model_page_url(url: str) -> bool:
+    path = urlparse(url).path.lower().rstrip("/")
+    return "glm-5-2" in path and (
+        "/ml/ai-gateway/" in path or "/explore/model-services/" in path
+    )
+
+
+def click_model_entry(model) -> None:
+    """优先点击模型卡片的可交互祖先，找不到时回退到文字节点。"""
+    target = model
+    try:
+        ancestors = model.locator(
+            "xpath=ancestor-or-self::*[self::a or self::button or "
+            "@role='button' or @role='link' or @tabindex='0'][1]"
+        )
+        if ancestors.count() > 0:
+            candidate = ancestors.first
+            if candidate.is_visible(timeout=500):
+                target = candidate
+    except Exception:
+        target = model
+
+    try:
+        target.scroll_into_view_if_needed(timeout=5_000)
+    except Exception:
+        pass
+    target.click(timeout=15_000)
 
 
 def generate_glm_access_token(
@@ -807,19 +888,29 @@ def generate_glm_access_token(
             GLM_MODEL_LABEL,
             allow_manual=allow_manual,
             timeout=300,
+            progress_label="GLM 5.2 in AI Gateway",
         )
         if not model:
             screenshot(page, "glm_model_missing")
-            raise RuntimeError("GLM 5.2 did not load in AI Gateway")
+            raise RuntimeError(
+                f"GLM 5.2 did not load in AI Gateway; current URL: {page.url}"
+            )
 
         print("  Opening GLM 5.2")
-        model.click()
+        click_model_entry(model)
         wait_for_navigation_stable(page, timeout=30)
+        if not wait_until(page, lambda: glm_model_page_url(page.url), timeout=45, interval=0.5):
+            screenshot(page, "glm_model_navigation_failed")
+            raise RuntimeError(
+                f"Clicking GLM 5.2 did not open its model page; current URL: {page.url}"
+            )
+        print(f"  GLM 5.2 page ready: {urlparse(page.url).path}")
         generate = wait_for_named_action(
             page,
             (GLM_TOKEN_ACTION,),
             allow_manual=allow_manual,
             timeout=180,
+            progress_label="Generate Access Token",
         )
         if generate:
             previous = token_from_page(page)
@@ -838,7 +929,10 @@ def generate_glm_access_token(
             pass
         if "resource not found" not in body.lower() or attempt == 3:
             screenshot(page, "glm_generate_action_missing")
-            raise RuntimeError("GLM 5.2 page did not expose Generate Access Token")
+            raise RuntimeError(
+                "GLM 5.2 page did not expose Generate Access Token; "
+                f"current URL: {page.url}"
+            )
         print(f"  GLM 5.2 is still provisioning; retrying from AI Gateway ({attempt}/3)...")
         resilient_goto(page, workspace, timeout=60_000)
         page.wait_for_timeout(10_000)
@@ -1089,14 +1183,16 @@ def auto_register(
     *,
     headless: bool = False,
     browser_channel: str | None = "chrome",
+    mail_provider: str = "outlook",
     outlook_credential_file: str | None = None,
     outlook_success_file: str | None = None,
     resume: bool = False,
     mail_timeout: int = 180,
     preferred_workspace: str | None = None,
 ) -> tuple[str, str, str, str] | None:
-    print("\nCreating Outlook Graph mail session")
+    print(f"\nCreating mail session with provider: {mail_provider}")
     mail = create_mail_client(
+        mail_provider,
         email=email,
         password=mail_password,
         outlook_credential_file=outlook_credential_file,
@@ -1176,10 +1272,10 @@ def auto_register(
             workspace,
             token,
             "OK",
-            f"flow={flow}",
+            f"mail_provider={mail_provider}; flow={flow}",
         )
         save_domain_token(workspace, token)
-        if outlook_credential_file:
+        if mail_provider == "outlook" and outlook_credential_file:
             source = Path(outlook_credential_file).expanduser().resolve()
             destination = Path(
                 outlook_success_file or OUTLOOK_SUCCESS_FILE
@@ -1205,7 +1301,7 @@ def auto_register(
             workspace,
             "",
             "CANCELLED",
-            f"flow={flow}; User interrupted",
+            f"mail_provider={mail_provider}; flow={flow}; User interrupted",
         )
         print("\nCancelled by user.")
         return None
@@ -1218,7 +1314,7 @@ def auto_register(
             workspace,
             "",
             "FAIL",
-            f"flow={flow}; {exc}",
+            f"mail_provider={mail_provider}; flow={flow}; {exc}",
         )
         traceback.print_exc()
         return None
@@ -1251,6 +1347,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--email", "-e", help="mail address or Outlook record selector")
     parser.add_argument("--password", "-p", help="Outlook password field")
     parser.add_argument(
+        "--mail-provider",
+        choices=("outlook", "outlook_tw"),
+        default="outlook",
+        help="mail provider",
+    )
+    parser.add_argument(
         "--outlook-credential-file",
         help="UTF-8 file containing email----password----refresh_token----client_id",
     )
@@ -1262,7 +1364,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mail-test",
         action="store_true",
-        help="test Outlook OAuth and Inbox access without opening Databricks",
+        help="test the selected mail provider without opening Databricks",
     )
     parser.add_argument(
         "--resume",
@@ -1283,23 +1385,38 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if (
+        args.mail_provider == "outlook"
+        and
         not args.outlook_credential_file
         and OUTLOOK_PENDING_FILE.exists()
     ):
         args.outlook_credential_file = str(OUTLOOK_PENDING_FILE)
+    if args.mail_provider == "outlook_tw":
+        if args.outlook_credential_file:
+            raise SystemExit("--outlook-credential-file requires --mail-provider outlook")
+        if args.password:
+            raise SystemExit("--password is not supported by --mail-provider outlook_tw")
+        if args.resume and not args.email:
+            raise SystemExit("--resume with outlook_tw requires the still-active --email")
+        if args.outlook_success_file != str(OUTLOOK_SUCCESS_FILE):
+            raise SystemExit("--outlook-success-file requires --mail-provider outlook")
     if args.headless and not args.workspace:
         print("Warning: QR verification requires a visible browser and will fail in headless mode.")
 
     channel = None if args.browser_channel.lower() == "bundled" else args.browser_channel
     if args.mail_test:
         client = create_mail_client(
+            args.mail_provider,
             email=args.email,
             password=args.password,
             outlook_credential_file=args.outlook_credential_file,
         )
         try:
             visible_messages = client.test_connection()
-            print(f"Outlook Graph OK: {client.address} (visible messages: {visible_messages})")
+            print(
+                f"Mail OK ({args.mail_provider}): {client.address} "
+                f"(visible messages: {visible_messages})"
+            )
             return 0
         finally:
             client.close()
@@ -1309,6 +1426,7 @@ def main(argv: list[str] | None = None) -> int:
         mail_password=args.password,
         headless=args.headless,
         browser_channel=channel,
+        mail_provider=args.mail_provider,
         outlook_credential_file=args.outlook_credential_file,
         outlook_success_file=args.outlook_success_file,
         resume=args.resume,

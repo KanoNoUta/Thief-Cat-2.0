@@ -65,6 +65,26 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(result, "response")
         self.assertEqual(page.goto.call_count, 2)
 
+    def test_resilient_goto_accepts_err_aborted_after_target_reached(self):
+        page = Mock()
+        target = "https://dbc-test.cloud.databricks.com/"
+        page.url = "https://login.databricks.com/setup"
+
+        def aborted_redirect(*_args, **_kwargs):
+            page.url = target
+            raise auto_register.PlaywrightError("Page.goto: net::ERR_ABORTED")
+
+        page.goto.side_effect = aborted_redirect
+        with patch.object(
+            auto_register,
+            "wait_for_navigation_stable",
+            return_value=target,
+        ):
+            result = auto_register.resilient_goto(page, target)
+
+        self.assertIsNone(result)
+        page.goto.assert_called_once()
+
     def test_workspace_domain_accepts_supported_hosts(self):
         self.assertEqual(
             auto_register.workspace_domain(
@@ -233,6 +253,38 @@ class TokenAndMailTests(unittest.TestCase):
         self.assertIs(result, text_match.nth.return_value)
         page.get_by_text.assert_called_once_with("Manage", exact=True)
 
+    def test_glm_model_page_url_accepts_current_and_legacy_routes(self):
+        self.assertTrue(
+            auto_register.glm_model_page_url(
+                "https://dbc-test.cloud.databricks.com/ml/ai-gateway/databricks-glm-5-2?o=1"
+            )
+        )
+        self.assertTrue(
+            auto_register.glm_model_page_url(
+                "https://dbc-test.cloud.databricks.com/explore/model-services/system/ai/glm-5-2"
+            )
+        )
+        self.assertFalse(
+            auto_register.glm_model_page_url(
+                "https://dbc-test.cloud.databricks.com/ml/ai-gateway"
+            )
+        )
+
+    def test_click_model_entry_prefers_clickable_ancestor(self):
+        model = Mock()
+        ancestors = Mock()
+        card = Mock()
+        ancestors.count.return_value = 1
+        ancestors.first = card
+        card.is_visible.return_value = True
+        model.locator.return_value = ancestors
+
+        auto_register.click_model_entry(model)
+
+        card.scroll_into_view_if_needed.assert_called_once_with(timeout=5_000)
+        card.click.assert_called_once_with(timeout=15_000)
+        model.click.assert_not_called()
+
     def test_generate_token_uses_ai_gateway_one_click_flow(self):
         page = Mock()
         with patch.object(
@@ -321,9 +373,13 @@ class CsvAndCliTests(unittest.TestCase):
     def test_parser_defaults(self):
         args = auto_register.build_parser().parse_args([])
         self.assertEqual(args.browser_channel, "chrome")
+        self.assertEqual(args.mail_provider, "outlook")
         self.assertTrue(args.outlook_success_file.endswith("outlook_success.txt"))
         self.assertFalse(args.headless)
         self.assertFalse(args.resume)
+
+        help_text = auto_register.build_parser().format_help()
+        self.assertIn("test the selected mail provider", help_text)
 
     def test_outlook_mail_test_does_not_start_browser(self):
         client = Mock()
@@ -334,6 +390,10 @@ class CsvAndCliTests(unittest.TestCase):
         self.assertEqual(result, 0)
         client.test_connection.assert_called_once_with()
         client.close.assert_called_once_with()
+
+    def test_outlook_tw_resume_requires_active_address(self):
+        with self.assertRaises(SystemExit):
+            auto_register.main(["--mail-provider", "outlook_tw", "--resume"])
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ __pycache__/
 screenshots/
 glm_keys.csv
 registered_accounts.csv
-databricks_tokens.csv
+databricks_tokens.*
 outlook_*.txt
 *.tmp
 dist/
